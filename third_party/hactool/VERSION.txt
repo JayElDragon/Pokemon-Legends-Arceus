@@ -1,0 +1,1 @@
+hactool 1d64a83450e025622f3468c28fc4164dad2c5ef6 (github.com/SciresM/hactool, ISC); main.c dropped: android/gamefiles.c drives it
