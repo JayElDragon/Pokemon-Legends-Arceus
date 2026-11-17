@@ -59,16 +59,32 @@ target_include_directories(hactool PUBLIC ${TP}/hactool ${TP}/hactool/mbedtls/in
 target_compile_definitions(hactool PRIVATE _BSD_SOURCE _DEFAULT_SOURCE _FILE_OFFSET_BITS=64)
 target_compile_options(hactool PRIVATE -O2 -w -fPIC)
 
+# libopus 1.5.2 (BSD): the game's music (runtime/services/hwopus.c, the Switch's Opus decoder service)
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+add_subdirectory(${TP}/opus opus EXCLUDE_FROM_ALL)
+set_target_properties(opus PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(main SHARED ${RT_C} ${RT_CXX} ${RT_UI} ${IMGUI_SRC} ${FSR2_SRC} android_glue.c vulkan_driver.c gamefiles.c)
 target_include_directories(main PRIVATE
     ${TP}/vulkan-headers/include ${TP}/vma/include ${RT} ${RT}/nvn ${IMGUI} ${IMGUI}/backends
     ${CMAKE_CURRENT_SOURCE_DIR}/inc ${TP}/smaa/Textures ${SHADERC_SRC}/libshaderc/include)
 target_compile_definitions(main PRIVATE
     GAMELIB_ID="android" SHADER_TRANSLATOR_ID="${TRANSLATOR_ID}" FFX_GCC
-    LARECOMP_ANDROID=1)
+    LARECOMP_ANDROID=1 HAVE_OPUS=1)
 target_compile_options(main PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Wno-format>
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -g -std=c++17 -fno-strict-aliasing -Wno-format>)
+# ThinLTO lets Clang optimize across the runtime's translation units. Keep the
+# runtime exports for the separately compiled game library.
+option(PLA_ANDROID_THINLTO "Enable ThinLTO for the Android runtime" ON)
+if(PLA_ANDROID_THINLTO)
+    target_compile_options(main PRIVATE -flto=thin)
+    target_link_options(main PRIVATE -flto=thin)
+endif()
 # -rdynamic equivalent: the game code library calls the runtime's functions (linked against libmain.so)
 target_link_options(main PRIVATE -Wl,--export-dynamic -Wl,-z,nostart-stop-gc)
-target_link_libraries(main PRIVATE SDL3::SDL3-shared shaderc_combined adrenotools hactool android log m dl)
+target_link_libraries(main PRIVATE SDL3::SDL3-shared shaderc_combined adrenotools hactool opus android log m dl)

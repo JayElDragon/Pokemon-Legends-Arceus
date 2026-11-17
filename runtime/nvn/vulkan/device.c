@@ -583,6 +583,29 @@ static void *pipeline_cache_saver(void *a) {  // every 3 minutes, when it grew
     return NULL;
 }
 
+// Qualcomm's own driver on an Adreno 6xx (Snapdragon 845-888 phones without Turnip): its extended dynamic state and
+// dynamic vertex input are known to draw wrong or lose the device (stretched polygons, missing geometry - the other
+// Switch ports turn them off there too). Those states go into the pipelines instead (the Vulkan 1.2 way, compat).
+// LARECOMP_ADRENO_OLD_EDS=1 / =0: as if it were / weren't such a driver (tests on another GPU).
+static bool old_adreno_blob(void) {
+    static int r = -1;
+    if (r >= 0) return r;
+    const char *e = getenv("LARECOMP_ADRENO_OLD_EDS");
+    if (e && *e) return r = atoi(e) != 0;
+    r = 0;
+#ifdef __ANDROID__
+    if (g_vk.props.vendorID == 0x5143) {
+        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        int m = android_adreno_model(g_vk.props.deviceName);
+        r = dp.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && m > 0 && m < 700;
+    }
+#endif
+    if (r) LOG("[vk] Qualcomm's driver on an Adreno 6xx: extended dynamic state and dynamic vertex input off (in the pipelines)\n");
+    return r;
+}
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -758,6 +781,8 @@ static void create_device(void) {
         // as the GPU overlap (exec.c overlap_on); LARECOMP_VK_DYN_VERTEX=1 turns it on
         bool amd = g_vk.props.vendorID == 0x1002;
         if (amd && !(e && *e)) off = true;
+        bool old_adreno = old_adreno_blob();
+        if (old_adreno && !(e && *e)) off = true;
         int cs = g_settings.gpu_compat[GPU_DYN_VERTEX];  // (F1 > Compatibility: Auto keeps the rules above)
         if (!(e && *e) && cs != GPU_AUTO) off = cs == GPU_OFF;
         g_vk.vids = vids_ext && have_vids.vertexInputDynamicState && !off;
@@ -766,6 +791,7 @@ static void create_device(void) {
                  !(e && *e) && cs == GPU_OFF ? "F1 > Compatibility" :
                  intel_legacy && !(e && *e) ? "Intel's older Windows driver: drew nothing with it" :
                  amd && !(e && *e) ? "off on AMD GPUs, #39; F1 > Compatibility or LARECOMP_VK_DYN_VERTEX=1: on" :
+                 old_adreno && !(e && *e) ? "Qualcomm's driver on an Adreno 6xx" :
                  off ? "LARECOMP_VK_DYN_VERTEX=0" :
                  !vids_ext ? "no VK_EXT_vertex_input_dynamic_state" : "vertexInputDynamicState not supported");
     }
@@ -966,6 +992,13 @@ static void create_device(void) {
         vkp_vkCmdSetCullMode = NULL, vkp_vkCmdSetFrontFace = NULL, vkp_vkCmdSetPrimitiveTopology = NULL,
         vkp_vkCmdSetDepthTestEnable = NULL, vkp_vkCmdSetDepthWriteEnable = NULL, vkp_vkCmdSetDepthCompareOp = NULL,
         vkp_vkCmdSetStencilTestEnable = NULL, vkp_vkCmdSetStencilOp = NULL;
+    if (old_adreno_blob()) {  // (old_adreno_blob: the states in the pipelines)
+        g_vkc.no_eds1 = true;
+        vkp_vkCmdSetCullMode = NULL, vkp_vkCmdSetFrontFace = NULL, vkp_vkCmdSetPrimitiveTopology = NULL,
+        vkp_vkCmdSetDepthTestEnable = NULL, vkp_vkCmdSetDepthWriteEnable = NULL, vkp_vkCmdSetDepthCompareOp = NULL,
+        vkp_vkCmdSetStencilTestEnable = NULL, vkp_vkCmdSetStencilOp = NULL;
+        vkp_vkCmdSetDepthBiasEnable = NULL, vkp_vkCmdSetPrimitiveRestartEnable = NULL;
+    }
     g_vkc.no_eds2 = !vkp_vkCmdSetDepthBiasEnable || !vkp_vkCmdSetPrimitiveRestartEnable;
     if (g_vkc.no_eds2) vkp_vkCmdSetDepthBiasEnable = NULL, vkp_vkCmdSetPrimitiveRestartEnable = NULL;
     LOG("[vk] Vulkan %u.%u%s: dynamic rendering %s, synchronization2 %s, extended dynamic state %s / %s\n",
@@ -1405,7 +1438,12 @@ static int ov_direct = -1;
 
 static bool ov_slot_ready(void) {  // (the slot's pool and buffer exist, and the buffer is free to record)
     if (!ov_pool[slot]) {
-        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        VkCommandPoolCreateFlags flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+#ifdef __ANDROID__
+        // Qualcomm can discard and remap transient pool memory on each reset.
+        if (g_vk.props.vendorID == 0x5143) flags = 0;
+#endif
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = flags,
                                       .queueFamilyIndex = g_vk.qfam};
         if (vkCreateCommandPool(g_vk.dev, &pi, NULL, &ov_pool[slot]) != VK_SUCCESS) { ov_pool[slot] = VK_NULL_HANDLE; return false; }
         VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = ov_pool[slot],
@@ -1780,6 +1818,22 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+#ifdef __ANDROID__
+    // (SDL on Android takes a relative path for the app's internal storage: the dumps / shots go to the data root -
+    // the working directory - as everywhere else; their folder is made here)
+    char abs[1024];
+    if (path[0] != '/') {
+        char cwd[512];
+        if (getcwd(cwd, sizeof cwd)) {
+            snprintf(abs, sizeof abs, "%s/%s", cwd, path);
+            char dir[1024];
+            snprintf(dir, sizeof dir, "%s", abs);
+            for (char *p = dir + strlen(cwd) + 1; *p; p++)
+                if (*p == '/') { *p = 0; mkdir(dir, 0775); *p = '/'; }
+            path = abs;
+        }
+    }
+#endif
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);

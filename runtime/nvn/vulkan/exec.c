@@ -8442,7 +8442,12 @@ static VkCommandBuffer fsr2_cmd(void) {
     static int k;
     k = (k + 1) & 3;
     if (!pool[k]) {
-        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        VkCommandPoolCreateFlags flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+#ifdef __ANDROID__
+        // Qualcomm can discard and remap transient pool memory on each reset.
+        if (g_vk.props.vendorID == 0x5143) flags = 0;
+#endif
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = flags,
                                       .queueFamilyIndex = g_vk.qfam};
         VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &pool[k]));
         VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool[k],

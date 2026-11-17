@@ -6,7 +6,10 @@
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
 #include <jni.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "rt.h"
 
@@ -32,11 +35,21 @@ static void load_global_commands(void) {
 #undef DEVICE
 }
 
+// Turnip (Mesa's driver for Adreno) needs Adreno's kernel driver: on Mali / PowerVR / Xclipse phones it finds no GPU
+// and the game never starts - those always use the system's Vulkan driver.
+bool pla_gpu_is_adreno(void) { return access("/dev/kgsl-3d0", F_OK) == 0; }
+
 void pla_vulkan_select_driver(void) {
     const char *path = getenv("PLA_VULKAN_DRIVER");
+    if (path && !pla_gpu_is_adreno()) {
+        LOG("[vk] not an Adreno GPU (no /dev/kgsl-3d0): Turnip skipped, the system's Vulkan driver instead\n");
+        path = NULL;
+    }
     const char *driver_dir = getenv("PLA_DRIVER_DIR");
     const char *hook_dir = getenv("PLA_NATIVE_DIR");
-    void *driver = path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : NULL;
+    // Turnip (an ICD on its own) is opened directly first; Qualcomm's own driver packs only through AdrenoTools below
+    // (its hooks and linker namespace)
+    void *driver = path && strstr(path, "freedreno") ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : NULL;
     if (driver) {
         instance_proc = (PFN_vkGetInstanceProcAddr)dlsym(driver, "vk_icdGetInstanceProcAddr");
         if (instance_proc) {
@@ -57,8 +70,12 @@ void pla_vulkan_select_driver(void) {
         }
     }
     if (path && !custom_driver && driver_dir && hook_dir) {
+        // (AdrenoTools loads the pack's library by its own name: Turnip's libvulkan_freedreno.so, Qualcomm's
+        // libvulkan_adreno.so, ... - DriverStore.java keeps the name meta.json gave)
+        const char *slash = strrchr(path, '/');
+        const char *lib = slash ? slash + 1 : path;
         driver = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM,
-                                            NULL, hook_dir, driver_dir, "libvulkan_freedreno.so", NULL, NULL);
+                                            NULL, hook_dir, driver_dir, lib, NULL, NULL);
         if (driver) {
             instance_proc = (PFN_vkGetInstanceProcAddr)dlsym(driver, "vkGetInstanceProcAddr");
             if (instance_proc) {

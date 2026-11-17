@@ -465,39 +465,50 @@ extern "C" double output_scale_dynamic_factor(void);
 extern "C" void pla_apply_power(void);  // android/android_glue.c
 extern "C" bool pla_driver_installed(void), pla_driver_turnip_chosen(void), pla_driver_turnip_active(void);
 extern "C" void pla_driver_choose(bool turnip), pla_driver_import(void), pla_restart_app(void);
-extern "C" void pla_driver_status(char *out, size_t n);
+extern "C" void pla_driver_status(char *out, size_t n), pla_driver_name(char *out, size_t n);
 // The graphics driver, part of the port's own settings (it was a separate Android dialog): the system's Vulkan
 // (Qualcomm) or an imported Turnip (Mesa). The choice is read when the app starts: a restart row when it differs.
+extern "C" bool pla_gpu_is_adreno(void);  // android/vulkan_driver.c
 static void android_driver_rows(void) {
     opt_section(UI_TR3("Graphics driver", "Driver gráfico", "Driver gráfico"));
+    if (!pla_gpu_is_adreno()) {  // (Mali / PowerVR / Xclipse: Turnip is Adreno's only - the system's Vulkan it is)
+        opt_action(UI_TR3("Vulkan driver", "Driver Vulkan", "Driver Vulkan"), UI_TR3("System", "Sistema", "Sistema"),
+                   UI_TR3("Turnip only exists for Adreno GPUs: this device uses its own Vulkan driver.",
+                          "O Turnip só existe para GPUs Adreno: este aparelho usa o próprio driver Vulkan.",
+                          "Turnip solo existe para GPUs Adreno: este dispositivo usa su propio driver Vulkan."), false);
+        return;
+    }
     static int frames;  // (the activity asked a few times a second, not every frame)
     static bool installed, chosen;
-    static char status[160];
+    static char status[160], dname[128];
     if (frames++ % 20 == 0) {
         installed = pla_driver_installed();
         chosen = installed && pla_driver_turnip_chosen();
         pla_driver_status(status, sizeof status);
+        pla_driver_name(dname, sizeof dname);
     }
     bool active = pla_driver_turnip_active();
-    const char *names[] = {UI_TR3("System (Qualcomm)", "Sistema (Qualcomm)", "Sistema (Qualcomm)"), "Turnip (Mesa)"};
+    // (the imported one by its own name: any AdrenoTools pack - Turnip, or Qualcomm's newer drivers - DriverStore.java)
+    const char *names[] = {UI_TR3("System (Qualcomm)", "Sistema (Qualcomm)", "Sistema (Qualcomm)"),
+                           dname[0] ? dname : UI_TR3("Imported driver", "Driver importado", "Driver importado")};
     int pick = chosen ? 1 : 0;
     if (!installed) opt_disable_next();
     if (opt_choice(UI_TR3("Vulkan driver", "Driver Vulkan", "Driver Vulkan"), &pick, names, 2, 0,
-                   installed ? UI_TR3("Turnip is often faster and draws more correctly; the system driver is Qualcomm's own.",
-                                      "O Turnip costuma ser mais rápido e correto; o do sistema é o da Qualcomm.",
-                                      "Turnip suele ir más rápido y dibujar mejor; el del sistema es el de Qualcomm.")
-                             : UI_TR3("Import a Turnip driver below to choose it.", "Importe um driver Turnip abaixo para escolhê-lo.",
-                                      "Importa un driver Turnip abajo para poder elegirlo."))) {
+                   installed ? UI_TR3("An imported driver (Turnip is often faster and draws more correctly) or the system's own.",
+                                      "Um driver importado (o Turnip costuma ser mais rápido e correto) ou o do sistema.",
+                                      "Un driver importado (Turnip suele ir más rápido y dibujar mejor) o el del sistema.")
+                             : UI_TR3("Import a driver below to choose it.", "Importe um driver abaixo para escolhê-lo.",
+                                      "Importa un driver abajo para poder elegirlo."))) {
         pla_driver_choose(pick == 1);
         chosen = pick == 1;
     }
-    opt_action(UI_TR3("In use now", "Em uso agora", "En uso ahora"), active ? "Turnip (Mesa)" : names[0],
+    opt_action(UI_TR3("In use now", "Em uso agora", "En uso ahora"), active ? names[1] : names[0],
                UI_TR3("The driver this session started with.", "O driver com que esta sessão começou.",
                       "El driver con el que arrancó esta sesión."), false);
-    if (opt_link(UI_TR3("Import Turnip (.zip or .so)", "Importar Turnip (.zip ou .so)", "Importar Turnip (.zip o .so)"),
-                 status[0] ? status : UI_TR3("A Mesa Turnip build for Android arm64 (libvulkan_freedreno.so, or a zip with it).",
-                                             "Um Turnip do Mesa para Android arm64 (libvulkan_freedreno.so, ou um zip com ele).",
-                                             "Un Turnip de Mesa para Android arm64 (libvulkan_freedreno.so, o un zip que lo tenga).")))
+    if (opt_link(UI_TR3("Import driver (.zip or .so)", "Importar driver (.zip ou .so)", "Importar driver (.zip o .so)"),
+                 status[0] ? status : UI_TR3("Any AdrenoTools driver pack (.zip with meta.json): Mesa Turnip or Qualcomm's newer drivers; or a bare .so.",
+                                             "Qualquer pacote de driver do AdrenoTools (.zip com meta.json): Turnip do Mesa ou drivers mais novos da Qualcomm; ou um .so.",
+                                             "Cualquier paquete de driver de AdrenoTools (.zip con meta.json): Turnip de Mesa o drivers más nuevos de Qualcomm; o un .so suelto.")))
         pla_driver_import();
     if (chosen != active) {
         opt_warn_next();
@@ -508,10 +519,35 @@ static void android_driver_rows(void) {
             pla_restart_app();
     }
 }
+extern "C" void pla_logs_export(void);  // (android/android_glue.c -> SaveTransfer.pickLogs)
 static void tab_android_video(bool advanced) {
     opt_begin("##android_video", ImGui::GetFontSize() / 34);
     if (advanced) android_driver_rows();
     if (!advanced) {
+        {   // (settings.c android_profile: picked from the GPU and RAM at the first start; here to switch, or to see it)
+            opt_section(UI_TR3("Performance", "Desempenho", "Rendimiento"));
+            const char *names[] = {UI_TR3("Light", "Leve", "Ligero"), UI_TR3("Medium", "Médio", "Medio"),
+                                   UI_TR3("High", "Alto", "Alto"), UI_TR3("Custom", "Personalizado", "Personalizado")};
+            int cur = settings_android_current_profile(), pick = cur < 0 ? 3 : cur;
+            int rec = g_video_rec.known ? g_video_rec.profile : VPROF_HIGH;
+            if (rec > VPROF_HIGH) rec = VPROF_HIGH;
+            char help[512];
+            snprintf(help, sizeof help, "%s %s (%s). %s",
+                     UI_TR3("Recommended for this device:", "Recomendado para este aparelho:", "Recomendado para este dispositivo:"),
+                     names[rec], g_video_rec.gpu,
+                     UI_TR3("Light: 75%, 30 fps, half-size shadows. Medium: resolution adjusts itself to hold 60 fps. "
+                            "High: 100%, 60 fps, water reflections.",
+                            "Leve: 75%, 30 fps, sombras pela metade. Médio: a resolução se ajusta sozinha para manter 60 fps. "
+                            "Alto: 100%, 60 fps, reflexos na água.",
+                            "Ligero: 75%, 30 fps, sombras a la mitad. Medio: la resolución se ajusta sola para mantener 60 fps. "
+                            "Alto: 100%, 60 fps, reflejos en el agua."));
+            if (opt_choice(UI_TR3("Performance profile", "Perfil de desempenho", "Perfil de rendimiento"), &pick, names,
+                           cur < 0 ? 4 : 3, rec, help) && pick <= VPROF_HIGH) {
+                settings_android_apply_profile(pick);
+                settings_save();
+                pla_draw_distance_apply_live();
+            }
+        }
         opt_section("Android");
         opt_toggle(UI_TR3("On-screen controls", "Controles na tela", "Controles en pantalla"), &g_settings.touch_controls, true,
                    UI_TR3("Show the touch buttons and sticks over the game.", "Mostra os botões e analógicos de toque sobre o jogo.",
@@ -548,14 +584,36 @@ static void tab_android_video(bool advanced) {
             }
         }
         opt_section(UI_TR3("Display", "Tela", "Pantalla"));
-        const char *res[] = {"50%", "75%", "100%"};
-        const int modes[] = {RES_Q50, RES_Q75, RES_MATCH};
-        int resolution = g_settings.res_mode == RES_Q50 ? 0 : g_settings.res_mode == RES_Q75 ? 1 : 2;
+        const char *res[] = {"50%", "75%", "100%", UI_TR3("Auto (dynamic)", "Auto (dinâmica)", "Auto (dinámica)")};
+        const int modes[] = {RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC};
+        int resolution = g_settings.res_mode == RES_Q50 ? 0 : g_settings.res_mode == RES_Q75 ? 1 :
+                         g_settings.res_mode == RES_DYNAMIC ? 3 : 2;
         if (opt_choice(UI_TR3("Internal resolution", "Resolução interna", "Resolución interna"),
-                       &resolution, res, 3, 2, UI_TR3("Lower the resolution to reduce GPU load.",
-                       "Reduza a resolução para aliviar a GPU.", "Baja la resolución para reducir la carga de la GPU."))) {
+                       &resolution, res, 4, 2, UI_TR3("Lower the resolution to reduce GPU load. Auto: lowers it by itself "
+                       "in busy places to hold the frame rate, raises it again when there's room.",
+                       "Reduza a resolução para aliviar a GPU. Auto: baixa sozinha em lugares pesados para manter a taxa "
+                       "de quadros e sobe de novo quando sobra.",
+                       "Baja la resolución para reducir la carga de la GPU. Auto: la baja sola en zonas cargadas para "
+                       "mantener los fps y la vuelve a subir cuando sobra."))) {
             g_settings.res_mode = modes[resolution];
             g_settings.res_auto = false;
+            settings_save();
+        }
+        {   // (vulkan/textures.c tex_shadow_scale: from the next start)
+            const char *sh[] = {UI_TR3("Half (faster)", "Metade (mais rápido)", "Mitad (más rápido)"),
+                                UI_TR3("Game's", "Do jogo", "Del juego")};
+            int pick = g_settings.shadow_res == 0 ? 0 : 1;
+            if (g_settings.shadow_res <= 1 &&
+                opt_choice(UI_TR3("Shadow resolution", "Resolução das sombras", "Resolución de sombras"), &pick, sh, 2, 1,
+                           UI_TR3("Half: the sun's shadows drawn at half size - faster on weak phones, softer shadow edges. "
+                                  "From the next start.",
+                                  "Metade: as sombras do sol desenhadas pela metade - mais rápido em celulares fracos, bordas "
+                                  "mais suaves. A partir do próximo início.",
+                                  "Mitad: las sombras del sol se dibujan a la mitad - más rápido en celulares débiles, bordes "
+                                  "más suaves. Desde el próximo inicio."))) {
+                g_settings.shadow_res = pick == 0 ? 0 : 1;
+                settings_save();
+            }
         }
         {   // (vulkan/exec.c post_process: SMAA on the game image before it is scaled to the screen)
             const char *aa[] = {UI_TR3("Off", "Desligado", "Apagado"), "SMAA", UI_TR3("Soft (recommended)", "Suave (recomendado)", "Suave (recomendado)")};
@@ -576,6 +634,27 @@ static void tab_android_video(bool advanced) {
             g_settings.fps60 = rate >= 1;
             g_settings.framegen = rate == 2;
         }
+        {   // (runtime/hle/framepace.c fps60_holds: the game counts frames - below 60 it would run in slow motion)
+            extern bool g_fps60_fell_back;
+            bool fall = !g_settings.fps60_lock;
+            ImGui::BeginDisabled(!g_settings.fps60);
+            if (opt_toggle(UI_TR3("Drop to 30 fps when needed", "Cair para 30 fps quando preciso", "Bajar a 30 fps cuando haga falta"),
+                           &fall, true,
+                           UI_TR3("When the phone can't keep 60 fps for a few seconds, the game goes to a steady 30 fps instead "
+                                  "of running in slow motion.",
+                                  "Quando o celular não segura 60 fps por alguns segundos, o jogo vai para 30 fps estáveis em vez "
+                                  "de rodar em câmera lenta.",
+                                  "Cuando el celular no aguanta 60 fps unos segundos, el juego pasa a 30 fps estables en vez de "
+                                  "ir en cámara lenta."))) {
+                g_settings.fps60_lock = !fall;
+                settings_save();
+            }
+            ImGui::EndDisabled();
+            if (g_settings.fps60 && g_fps60_fell_back)
+                ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                                   UI_TR3("Running at 30 fps: 60 wasn't held.", "Rodando a 30 fps: 60 não se manteve.",
+                                          "Corriendo a 30 fps: no se mantuvieron 60."));
+        }
         opt_toggle(UI_TR3("Show FPS", "Mostrar FPS", "Mostrar FPS"), &g_settings.show_fps, false,
                    UI_TR3("Show the performance counter.", "Mostra o contador de desempenho.", "Muestra el contador de rendimiento."));
     } else {
@@ -588,6 +667,15 @@ static void tab_android_video(bool advanced) {
             g_settings.aniso16 = aniso != 0;
         opt_toggle(UI_TR3("Water reflections", "Reflexos na água", "Reflejos en el agua"), &g_settings.water_ssr, false,
                    UI_TR3("Adds screen-space reflections.", "Adiciona reflexos em espaço de tela.", "Añade reflejos en espacio de pantalla."));
+        opt_section(UI_TR3("Support", "Suporte", "Soporte"));
+        if (opt_button(UI_TR3("Export logs", "Exportar registros", "Exportar registros"),
+                       UI_TR3("Saves the port's logs and settings in a .zip to send with a report: they say which GPU, driver "
+                              "and profile this phone uses and how fast it ran.",
+                              "Salva os registros e ajustes do port num .zip para mandar junto com um relato: dizem a GPU, o "
+                              "driver e o perfil deste celular e a velocidade em que rodou.",
+                              "Guarda los registros y ajustes del port en un .zip para enviarlo con un reporte: dicen la GPU, "
+                              "el driver y el perfil de este celular y a qué velocidad corrió.")))
+            pla_logs_export();
     }
     opt_end();
 }
@@ -829,15 +917,17 @@ static void tab_video_advanced(bool in_game) {
                   "e mistura só ao longo delas, então as texturas continuam nítidas. Ajuda mais numa resolução interna menor."));
     {   // shadow map size (vulkan/textures.c tex_shadow_scale: taken at start) and filter width (vulkan/exec.c texture_info)
         const char *sz[] = {TR("Game's", "Do jogo"), "2x", "3x", "4x"};
-        int si = g_settings.shadow_res - 1;
-        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, sz, 4, 0,
+        const char *szr[] = {TR("Half", "Metade"), TR("Game's", "Do jogo"), "2x", "3x", "4x"};
+        int si = g_settings.shadow_res;  // (0: half - the low-spec phones' profile)
+        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, szr, 5, 1,
                        TR("The size of the map the sun's shadows are drawn from (the game's: 1024 x 1024). Higher: smoother "
                           "shadow edges, without the stair steps, at a little GPU time and more GPU memory (4x: about 240 MB, "
-                          "2x: 60 MB). From the next start.",
+                          "2x: 60 MB). Half: faster on weak phones, softer shadows. From the next start.",
                           "O tamanho do mapa de onde saem as sombras do sol (o do jogo: 1024 x 1024). Maior: bordas das "
                           "sombras mais lisas, sem os degraus, por um pouco de tempo da GPU e mais memória da GPU (4x: uns "
-                          "240 MB, 2x: 60 MB). A partir do próximo início.")))
-            g_settings.shadow_res = si + 1;
+                          "240 MB, 2x: 60 MB). Metade: mais rápido em celulares fracos, sombras mais suaves. A partir do "
+                          "próximo início.")))
+            g_settings.shadow_res = si;
         int sh = g_settings.shadow_sharp - 1;
         const char *shd = TR("How soft the edges of the sun's shadows are: the game's own blur, or 2-4 times narrower - "
                              "sharper shadows. At most the shadow resolution (its blur is measured in the map's texels). "
@@ -845,7 +935,7 @@ static void tab_video_advanced(bool in_game) {
                              "O quanto as bordas das sombras do sol são suaves: o desfoque do próprio jogo, ou 2-4 vezes "
                              "mais estreito - sombras mais nítidas. No máximo a resolução das sombras (o desfoque é medido "
                              "nos texels do mapa). Muda na hora.");
-        if (g_settings.shadow_res == 1) opt_disable_next();  // (nothing to narrow at the game's size)
+        if (g_settings.shadow_res <= 1) opt_disable_next();  // (nothing to narrow at the game's size or below)
         if (opt_choice(TR("Shadow sharpness", "Nitidez das sombras"), &sh, sz, 4, 0, shd))
             g_settings.shadow_sharp = sh + 1;
     }

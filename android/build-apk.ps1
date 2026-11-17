@@ -1,7 +1,7 @@
 ﻿# Builds the runtime (CMake/Ninja, NDK), stages the native libraries and assembles the debug APK.
 # -Install: installs it on the Odin (serial 1234cf8d) and starts it. The game code library (libgame.so) is built
 # separately (android/gamelib_ninja.py + ninja -C build/android-game) and staged when present.
-param([switch]$Install, [switch]$WithoutGame, [string]$Serial = '1234cf8d')
+param([switch]$Install, [switch]$WithoutGame, [string]$ToolchainDir, [string]$Serial = '1234cf8d')
 $ErrorActionPreference = 'Continue'  # (native tools write warnings to stderr; exit codes are checked)
 $root = Split-Path $PSScriptRoot -Parent
 $sdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
@@ -22,6 +22,7 @@ Copy-Item (Join-Path $ndk 'toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\l
 $game = Join-Path $root 'build\android-game\libgame.so'
 if (!$WithoutGame -and (Test-Path $game)) { Copy-Item $game $jni -Force }
 [string[]]$gradleOptions = if ($WithoutGame) { @('-PwithoutGame=true') } else { @() }
+if ($ToolchainDir) { $gradleOptions += "-PandroidToolchain=$((Resolve-Path -LiteralPath $ToolchainDir).Path)" }
 
 Push-Location $PSScriptRoot
 try {

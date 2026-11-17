@@ -173,6 +173,12 @@ void settings_resolve_defaults(bool integrated) {
     g_default_upscaler = UPSCALE_FSR1;
 #endif
     g_default_res_mode = RES_MATCH;  // (Dynamic is not a default until it is reliable: user 2026-10-18)
+#ifdef __ANDROID__
+    // A GPU that isn't an Adreno (Arm Mali / Imagination PowerVR - MediaTek, Exynos, Tensor phones): 75% by default,
+    // FSR 1 to the screen - their drivers are slower with this game's ~56 render passes a frame, and the BC textures
+    // they lack cost memory bandwidth decoded (textures.c bc_decode). The player's own choice is kept.
+    if (g_gpu_vendor && g_gpu_vendor != 0x5143) g_default_res_mode = RES_Q75;
+#endif
     if (g_settings.upscaler_auto) g_settings.upscaler = g_default_upscaler;
     if (g_settings.res_auto) g_settings.res_mode = g_default_res_mode;
     LOG("[settings] %s GPU: upscaler %s (%s), resolution %s (%s), anti-aliasing %s\n", integrated ? "integrated" : "discrete / other",
@@ -230,15 +236,96 @@ static int gpu_profile(unsigned vendor, bool integrated, uint64_t vram, const ch
     return gb >= 8 ? VPROF_HIGH : VPROF_MEDIUM;  // (other dedicated GPUs: unknown names)
 }
 
+int android_adreno_model(const char *name) {
+    return name ? model_after(name, "Adreno (TM)") ? model_after(name, "Adreno (TM)") : model_after(name, "Adreno") : 0;
+}
+
+int android_ram_gb(void) {
+    return (SDL_GetSystemRAM() + 512) / 1024;
+}
+
+#ifdef __ANDROID__
+// A phone's profile from its GPU (Adreno model, Mali generation, Xclipse, PowerVR) and its RAM. High: the Odin 3's
+// settings (Adreno 830: 100%, 60 fps at ~52 °C) - Snapdragon 8 Gen 2 and up; Medium: 75%, dynamic resolution, 60 fps
+// that falls back to 30 by itself - Snapdragon 8 Gen 1 / 888 / 870 / 7+ Gen, Dimensity 9000-9400, Exynos Xclipse;
+// Light: 50%, 30 fps, low-spec shadows (half size), no ambient occlusion, water reflections or edge smoothing - the
+// rest (Adreno 640 and older, Mali G57-G610 class, PowerVR) and any phone with 6 GB of RAM or less (the game's own
+// ~4 GB with the decoded textures). Ultra is never picked on a phone.
+static int android_profile(unsigned vendor, const char *name, int ram_gb) {
+    int p = VPROF_MEDIUM, m;
+    if (vendor == 0x5143 && (m = android_adreno_model(name))) {  // Qualcomm Adreno
+        if (m >= 740) p = VPROF_HIGH;                  // (8 Gen 2 / 3 / Elite: 740, 750, 830, 840)
+        else if (m >= 650) p = VPROF_MEDIUM;            // (650 / 660 / 690, 710-735)
+        else p = VPROF_LIGHT;                           // (642L, 640, 630, 620, 619, 618... )
+    } else if (vendor == 0x13B5) {  // Arm Mali / Immortalis ("Mali-G710 MC10", "Immortalis-G720 MC12")
+        const char *g = strstr(name, "-G");
+        m = g ? atoi(g + 2) : 0;
+        // (G710 / G715 / G720 / G925, Immortalis: Dimensity 9000+; G610 / G78 / G77 / G57 / G52: the rest)
+        p = strstr(name, "Immortalis") || m >= 710 ? VPROF_MEDIUM : VPROF_LIGHT;
+    } else if (vendor == 0x144D) {  // Samsung Xclipse (RDNA 2 / 3)
+        p = VPROF_MEDIUM;
+    } else if (vendor == 0x1010) {  // Imagination PowerVR
+        p = VPROF_LIGHT;
+    }
+    if (ram_gb <= 6) p = VPROF_LIGHT;
+    else if (ram_gb <= 8 && p > VPROF_MEDIUM) p = VPROF_MEDIUM;
+    return p > VPROF_HIGH ? VPROF_HIGH : p;
+}
+
+// A phone profile's values. High: 100%, 60 fps, water reflections. Medium: dynamic resolution (down to a third of the
+// screen's lines, at least 540, when a frame misses its time; back up when there's room). Light: 75%, 30 fps, shadow
+// maps at half size, no edge smoothing. All: Standard draw distance, no ambient occlusion, plain texture filtering,
+// 60 fps that drops to 30 by itself when the phone can't hold it (the game counts frames: below 60 it would run slow).
+static void android_rec(VideoRec *r, int p) {
+    r->profile = p;
+    r->res_mode = p >= VPROF_HIGH ? RES_MATCH : p == VPROF_MEDIUM ? RES_DYNAMIC : RES_Q75;
+    r->fps60 = p >= VPROF_MEDIUM, r->fps60_lock = false;
+    r->aniso16 = false;
+    r->draw_distance = DRAW_DISTANCE_STANDARD;
+    r->antialias = p == VPROF_LIGHT ? AA_OFF : AA_SOFT;
+    r->shadow_res = p == VPROF_LIGHT ? 0 : 1;
+    r->gtao = 0;
+    r->water_ssr = p >= VPROF_HIGH;
+}
+
+void settings_android_apply_profile(int p) {
+    VideoRec r = g_video_rec;
+    android_rec(&r, p < VPROF_LIGHT ? VPROF_LIGHT : p > VPROF_HIGH ? VPROF_HIGH : p);
+    r.known = true;
+    VideoRec keep = g_video_rec;
+    g_video_rec = r;
+    settings_video_apply_recommended();
+    g_video_rec = keep;
+    LOG("[settings] performance profile %s applied\n", video_profile_name(r.profile, false));
+}
+
+int settings_android_current_profile(void) {
+    for (int p = VPROF_LIGHT; p <= VPROF_HIGH; p++) {
+        VideoRec r = {0};
+        android_rec(&r, p);
+        if (g_settings.res_mode == r.res_mode && g_settings.fps60 == r.fps60 && g_settings.fps60_lock == r.fps60_lock &&
+            g_settings.antialias == r.antialias && g_settings.shadow_res == r.shadow_res &&
+            g_settings.draw_distance == r.draw_distance && g_settings.water_ssr == r.water_ssr && g_settings.gtao == r.gtao &&
+            g_settings.aniso16 == r.aniso16)
+            return p;
+    }
+    return -1;
+}
+#endif
+
 void settings_video_recommend(unsigned vendor, bool integrated, uint64_t vram, const char *gpu_name) {
     // (the settings file read first: on Linux a game started with --play makes its window before the boot reads it,
     // and the defaults' "auto" would have been applied and saved over the player's own file)
     settings_load();
     int threads = SDL_GetNumLogicalCPUCores(), ram_gb = (SDL_GetSystemRAM() + 512) / 1024;
+#ifdef __ANDROID__
+    int p = android_profile(vendor, gpu_name ? gpu_name : "", ram_gb);
+#else
     int p = gpu_profile(vendor, integrated, vram, gpu_name ? gpu_name : "");
     if (threads < 8 && p > VPROF_MEDIUM) p = VPROF_MEDIUM;  // (60 fps needs the game code's speed)
     if (threads < 6 || ram_gb < 12) p = VPROF_LIGHT;
     else if (ram_gb < 16 && p > VPROF_HIGH) p = VPROF_HIGH;
+#endif
     const char *e = getenv("LARECOMP_VIDEO_PROFILE");
     if (e && *e)
         for (int i = 0; i < VPROF_N; i++)
@@ -248,6 +335,12 @@ void settings_video_recommend(unsigned vendor, bool integrated, uint64_t vram, c
     r->res_mode = p == VPROF_LIGHT ? RES_Q75 : p == VPROF_ULTRA ? RES_X15 : 1;
     r->fps60 = p >= VPROF_HIGH;
     r->aniso16 = p != VPROF_LIGHT;
+    r->fps60_lock = r->fps60;
+    r->draw_distance = g_settings.draw_distance, r->antialias = g_settings.antialias;
+    r->shadow_res = g_settings.shadow_res, r->gtao = g_settings.gtao, r->water_ssr = g_settings.water_ssr;
+#ifdef __ANDROID__
+    android_rec(r, p);
+#endif
     snprintf(r->gpu, sizeof r->gpu, "%s", gpu_name ? gpu_name : "");
     r->known = true;
     LOG("[settings] recommended video: %s (%s, %llu GB video memory, %d threads, %d GB RAM): resolution %s, %s fps%s\n",
@@ -265,14 +358,18 @@ void settings_video_apply_recommended(void) {
     const VideoRec *r = &g_video_rec;
     if (!r->known) return;
     g_settings.res_mode = r->res_mode, g_settings.res_auto = false;
-    g_settings.fps60 = g_settings.fps60_lock = r->fps60;  // (60 fps: "always", not the experimental fallback)
+    g_settings.fps60 = r->fps60, g_settings.fps60_lock = r->fps60_lock;  // (PC: "always", not the experimental fallback)
     g_settings.aniso16 = r->aniso16;
+    g_settings.draw_distance = r->draw_distance, g_settings.antialias = r->antialias;
+    g_settings.shadow_res = r->shadow_res, g_settings.gtao = r->gtao, g_settings.water_ssr = r->water_ssr;
 }
 
 bool settings_video_matches_recommended(void) {
     const VideoRec *r = &g_video_rec;
     return r->known && g_settings.res_mode == r->res_mode && g_settings.fps60 == r->fps60 &&
-           g_settings.fps60_lock == r->fps60 && g_settings.aniso16 == r->aniso16;
+           g_settings.fps60_lock == r->fps60_lock && g_settings.aniso16 == r->aniso16 &&
+           g_settings.draw_distance == r->draw_distance && g_settings.antialias == r->antialias &&
+           g_settings.shadow_res == r->shadow_res && g_settings.gtao == r->gtao && g_settings.water_ssr == r->water_ssr;
 }
 
 static bool android_aa_seen;  // (Android: the SMAA default was applied once - settings_load)
@@ -339,7 +436,7 @@ void settings_load(void) {
         else if (!strcmp(key, "operation_mode")) g_settings.opmode = !strcmp(val, "handheld") ? 2 : !strcmp(val, "docked") ? 1 : 0;
         else if (!strcmp(key, "dynamic_res")) g_settings.game_drs = !strcmp(val, "game");
         else if (!strcmp(key, "tex_hd")) g_settings.tex_hd = atoi(val) != 0;
-        else if (!strcmp(key, "shadow_resolution")) { int v = atoi(val); g_settings.shadow_res = v < 1 ? 1 : v > 4 ? 4 : v; }
+        else if (!strcmp(key, "shadow_resolution")) { int v = atoi(val); g_settings.shadow_res = v < 0 ? 0 : v > 4 ? 4 : v; }  // (0: half - Android low spec)
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "ambient_occlusion_strength")) { int v = atoi(val); g_settings.gtao_strength = v < 25 ? 25 : v > 100 ? 100 : v; }

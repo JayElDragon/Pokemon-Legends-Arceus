@@ -93,10 +93,14 @@ static bool exists(const char *p) {
 }
 
 // The places to look, in order (gamelib.h). Returns how many were filled.
-static int candidates(const char *game_dir, char out[3][1100]) {
+static int candidates(const char *game_dir, char out[4][1100]) {
     int n = 0;
     const char *env = getenv("LARECOMP_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
+#ifdef __ANDROID__
+    const char *private_dir = getenv("LARECOMP_ANDROID_BUILD_DIR");
+    if (private_dir && *private_dir) snprintf(out[n++], 1100, "%s/%s", private_dir, GAMELIB_NAME);
+#endif
     char exe_side[1024];
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
         snprintf(out[n++], 1100, "%s", exe_side);
@@ -108,14 +112,18 @@ bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
 #ifdef __ANDROID__
     const char *packaged = getenv("LARECOMP_GAME_LIB");
-    if (packaged && *packaged) return exists(packaged);
+    if (packaged && *packaged && exists(packaged)) return true;
 #endif
     char want[GAMELIB_FULL_ID_SIZE];
     if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
-    char c[3][1100];
+    char c[4][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
-        if (exists(c[i]) && id_matches(c[i], want) && state_matches(game_dir, want)) return true;
+        if (exists(c[i]) && id_matches(c[i], want)
+#ifndef __ANDROID__
+            && state_matches(game_dir, want)
+#endif
+        ) return true;
     return false;
 }
 
@@ -174,13 +182,17 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
             if (why) snprintf(why, why_size, "%s", g_error);
             return false;
         }
-        char c[3][1100];
+        char c[4][1100];
         int n = candidates(game_dir, c);
         const char *env = getenv("LARECOMP_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
             if (!exists(c[i])) continue;
             bool given = i == 0 && env && *env;  // LARECOMP_GAME_LIB: loaded as given, the library's own id decides
-            if (!given && (!id_matches(c[i], want) || !state_matches(game_dir, want))) {
+            if (!given && (!id_matches(c[i], want)
+#ifndef __ANDROID__
+                           || !state_matches(game_dir, want)
+#endif
+            )) {
                 snprintf(g_error, sizeof g_error, "%s was built for another version or hardware", c[i]);
                 continue;
             }

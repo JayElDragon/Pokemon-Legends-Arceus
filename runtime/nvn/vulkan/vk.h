@@ -228,6 +228,9 @@ typedef struct TexBackend {
     uint32_t pending_uv_off;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
+    uint8_t bc_kind;   // BCn without GPU support (Mali, PowerVR, Qualcomm's own driver): 1-7 = BC1-BC7, decoded on upload (bcdec)
+    bool bc_signed;    // (BC4 / BC5 SNORM, BC6H SF16)
+    uint8_t bc_skip;   // 1: decoded without its largest level (a phone with little RAM: textures.c bc_half) - level n is the game's n + 1
     int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)

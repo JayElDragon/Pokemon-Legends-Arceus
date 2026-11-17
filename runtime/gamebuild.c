@@ -1,5 +1,6 @@
 // Builds the game code library on the player's machine (runtime/gamebuild.h).
 #include "gamebuild.h"
+#include <errno.h>
 #include "build_cache.h"
 
 #include <pthread.h>
@@ -19,7 +20,11 @@
 
 // From the Makefile: the flags the game code is compiled and linked with (as `make` builds it in a source checkout)
 #ifndef GAMELIB_CFLAGS
+#ifdef __ANDROID__
+#define GAMELIB_CFLAGS "-O1 -fPIC -DGUEST_VOLATILE -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden"
+#else
 #define GAMELIB_CFLAGS "-O1 -fno-strict-aliasing -fvisibility=hidden"
+#endif
 #endif
 #ifndef GAMELIB_SHARED
 #define GAMELIB_SHARED "-shared"
@@ -126,6 +131,10 @@ static bool find_tools(Tools *t) {
              !(rt_resource(NULL, "tools/" PLAT_VENV_PYTHON, t->gen, sizeof t->gen) &&
                rt_resource(NULL, "tools/gen.py", t->gen_script, sizeof t->gen_script)))
         return false;
+#ifdef __ANDROID__
+    const char *script = getenv("LARECOMP_GEN_SCRIPT");
+    if (script && *script) snprintf(t->gen_script, sizeof t->gen_script, "%s", script);
+#endif
     e = getenv("LARECOMP_CC");
     if (e && *e) snprintf(t->cc, sizeof t->cc, "%s", e);
     else if (rt_resource("zig" SEP "zig" PLAT_EXE_SUFFIX, NULL, t->cc, sizeof t->cc)) t->zig = true;
@@ -133,6 +142,19 @@ static bool find_tools(Tools *t) {
     else if (rt_dev_mode() && file_exists("/usr/bin/clang")) snprintf(t->cc, sizeof t->cc, "/usr/bin/clang");
 #endif
     else return false;
+#ifdef __ANDROID__
+    if (!file_exists(t->gen) || !file_exists(t->cc)) return false;
+#endif
+#ifdef __ANDROID__
+    const char *android_src = getenv("LARECOMP_ANDROID_GAMELIB_SRC");
+    if (android_src && *android_src) {
+        if (snprintf(t->inc, sizeof t->inc, "%s", android_src) >= sizeof t->inc ||
+            snprintf(t->entry, sizeof t->entry, "%s/gamelib_entry.c", android_src) >= sizeof t->entry ||
+            snprintf(t->hle, sizeof t->hle, "%s/hle_symbols.txt", android_src) >= sizeof t->hle)
+            return false;
+        return file_exists(t->entry) && file_exists(t->hle);
+    }
+#endif
     if (!rt_resource("gamelib-src" SEP "cpu.h", "runtime/cpu.h", t->inc, sizeof t->inc) ||
         !rt_resource("gamelib-src" SEP "gamelib_entry.c", "tools/gamelib_entry.c", t->entry, sizeof t->entry) ||
         !rt_resource("gamelib-src" SEP "hle_symbols.txt", "runtime/hle/hle_symbols.txt", t->hle, sizeof t->hle))
@@ -173,6 +195,13 @@ bool gamebuild_available(void) {
 
 static void compiler(Args *a, const Tools *t) {
     add(a, t->cc);
+#ifdef __ANDROID__
+    add(a, "--target=aarch64-linux-android33");
+    const char *sysroot = getenv("LARECOMP_ANDROID_SYSROOT");
+    if (sysroot && *sysroot) { add(a, "--sysroot"); add(a, sysroot); }
+    const char *resources = getenv("LARECOMP_ANDROID_CLANG_RES");
+    if (resources && *resources) { add(a, "-resource-dir"); add(a, resources); }
+#endif
     if (t->zig) add(a, "cc");
     if (t->zig && ZIG_TARGET[0]) add(a, "-target"), add(a, ZIG_TARGET);
 }
@@ -328,6 +357,15 @@ static bool cold_giant(const char *src) {
     if (defs != 1 || labels <= limit) return false;
     for (size_t i = 0; i < sizeof HOT_GIANTS / sizeof HOT_GIANTS[0]; i++)
         if (!strcmp(name, HOT_GIANTS[i])) return false;
+    // Pokémon Legends Arceus: its hot giants by chunk name (android/gamelib_ninja.py's HOT_GIANTS)
+    static const char *const PLA_HOT[] = {"main_1654", "main_033", "main_1611", "main_1590", "main_1574",
+                                          "main_1236", "main_1636", "main_080", "main_039"};
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    for (size_t i = 0; i < sizeof PLA_HOT / sizeof PLA_HOT[0]; i++) {
+        size_t n = strlen(PLA_HOT[i]);
+        if (!strncmp(base, PLA_HOT[i], n) && !strcmp(base + n, ".c")) return false;
+    }
     return true;
 }
 
@@ -394,7 +432,12 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         return false;
     }
     char work[1100], tmp[1100];
-    snprintf(work, sizeof work, "%s" SEP ".gamebuild", game_dir);
+    const char *build_dir = game_dir;
+#ifdef __ANDROID__
+    const char *private_dir = getenv("LARECOMP_ANDROID_BUILD_DIR");
+    if (private_dir && *private_dir) build_dir = private_dir;
+#endif
+    snprintf(work, sizeof work, "%s" SEP ".gamebuild", build_dir);
     snprintf(tmp, sizeof tmp, "%s" SEP "%s.tmp", work, GAMELIB_NAME);
     char input_paths[8][1100], spec[4096];
     snprintf(input_paths[0], sizeof input_paths[0], "%s" SEP "exefs" SEP "main", game_dir);
@@ -416,8 +459,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
              GAMELIB_CFLAGS, GAMELIB_SHARED, t.zig, (int)sizeof(void *),  // (+ the Linux zig target: objects from
              t.zig && ZIG_TARGET[0] ? " target=" : "", t.zig ? ZIG_TARGET : "");  // before it are rebuilt once)
     if (o->progress) o->progress(0, "Checking completed build files...");
-    bool resuming = build_cache_resumable(game_dir);  // (a cancelled or interrupted build; read before open marks this one)
-    BuildCache *cache = build_cache_open(game_dir, spec, inputs, 5, why, why_size);
+    bool resuming = build_cache_resumable(build_dir);  // (read before open marks this build)
+    BuildCache *cache = build_cache_open(build_dir, spec, inputs, 5, why, why_size);
     if (!cache) return false;
     // an update keeps the last good build's objects (open drops them when compiler, headers or flags changed)
     bool update = false;
@@ -427,9 +470,13 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         snprintf(rp, sizeof rp, "%s" SEP "gamelib_entry.receipt", work);
         update = stat(rp, &st) == 0;
     }
-    const char *gen_inputs[7] = {input_paths[0], input_paths[1], t.gen, t.hle};
+    const char *gen_inputs[8] = {input_paths[0], input_paths[1], t.gen, t.hle};
     int ngen = 4;
     if (t.gen_script[0]) gen_inputs[ngen++] = t.gen_script;
+#ifdef __ANDROID__
+    const char *toolchain_id = getenv("LARECOMP_ANDROID_TOOLCHAIN_ID");
+    if (toolchain_id && *toolchain_id) gen_inputs[ngen++] = toolchain_id;
+#endif
     for (int i = 0; i < nsub; i++) gen_inputs[ngen++] = input_paths[6 + i];
     if (!build_cache_prepare_generation(cache, GAMELIB_ID, gen_inputs, ngen, why, why_size)) {
         build_cache_failed(cache);
@@ -461,7 +508,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 
     // 1. the generator, every module at once; their finished files are compiled while it goes on
     Gen gens[4] = {{.name = "main"}, {.name = "sdk"}, {.name = "subsdk0"}, {.name = "subsdk1"}};
-    static const char *const base[4] = {"0x7000000000", "0x7008000000", "0x700a000000", "0x700b000000"};
+    const uint64_t base[4] = {MAIN_BASE, SDK_BASE, SUBSDK_BASE, SUBSDK_BASE + SUBSDK_STEP};
     _Static_assert(SUBSDK_BASE + GUEST_SHIFT == 0x700a000000ull && SUBSDK_STEP == 0x1000000ull, "base[] follows the loader");
     const int nmods = 2 + nsub;
     bool ok = true;
@@ -482,8 +529,14 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         if (t.gen_script[0]) add(&a, t.gen_script);
         add(&a, g->name);
         add(&a, nso);
-        add(&a, base[i]);
+        char address[32];
+        snprintf(address, sizeof address, "0x%llx", (unsigned long long)base[i]);
+        add(&a, address);
         add(&a, g->out);
+#ifdef __ANDROID__
+        add(&a, "--simd");
+        add(&a, "asm");
+#endif
         if (i == 1) { add(&a, "--hle"); add(&a, t.hle); }
         g->p = spawn(a.v, g->log);
         args_free(&a);
@@ -640,6 +693,17 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             add(&a, "-o");
             add(&a, tmp);
             add(&a, at);
+#ifdef __ANDROID__
+            const char *runtime = getenv("LARECOMP_ANDROID_RUNTIME");
+            if (runtime && *runtime) add(&a, runtime);
+            const char *linker = getenv("LARECOMP_ANDROID_LLD");
+            if (linker && *linker) {
+                char opt[1200];
+                snprintf(opt, sizeof opt, "--ld-path=%s", linker);
+                add(&a, opt);
+            }
+            add(&a, "-lm");
+#endif
 #ifdef _WIN32
             add(&a, t.implib);
 #endif
@@ -664,6 +728,12 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             helper_failed("linking", r, log, why, why_size);
             ok = false;
         }
+#ifdef __ANDROID__
+        if (ok && chmod(tmp, 0400) != 0) {
+            snprintf(why, why_size, "Could not make the game library read-only: %s", strerror(errno));
+            ok = false;
+        }
+#endif
     }
     if (ok) ok = build_cache_publish(cache, GAMELIB_NAME, g_full_id, why, why_size);
     bool cancelled = !ok && o->cancelled && o->cancelled();

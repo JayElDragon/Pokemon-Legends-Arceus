@@ -155,13 +155,13 @@ void parse_hex_key(unsigned char *key, const char *hex, unsigned int len) {
     /* PokeL-ARecomp: a newer prod.keys can carry a value of another length under a name this hactool knows (a
        34-digit one in the Odin 3 test): skipped like an unknown key - the keys the game needs are well formed */
     if (strlen(hex) != 2 * len) {
-        fprintf(stderr, "[WARN] key (%s) isn't %"PRIu32" hex digits: skipped\n", hex, 2 * len);
+        fprintf(stderr, "[WARN] key value isn't %"PRIu32" hex digits: skipped\n", 2 * len);
         return;
     }
 
     for (unsigned int i = 0; i < 2 * len; i++) {
         if (!ishex(hex[i])) {
-            fprintf(stderr, "[WARN] key (%s) isn't %"PRIu32" hex digits: skipped\n", hex, 2 * len);
+            fprintf(stderr, "[WARN] key value isn't %"PRIu32" hex digits: skipped\n", 2 * len);
             return;
         }
     }
@@ -201,7 +201,7 @@ void extkeys_parse_titlekeys(hactool_settings_t *settings, FILE *f) {
             }
             if (should_ignore_key) {
                 if (!settings->skip_key_warnings) {
-                    fprintf(stderr, "[WARN]: Invalid title.keys content: \"%s\", (value \"%s\")\n", key, value);
+                    fprintf(stderr, "[WARN]: Invalid title.keys content: \"%s\"\n", key);
                 }
             } else {
                 parse_hex_key(rights_id, key, sizeof(rights_id));
@@ -458,7 +458,7 @@ void extkeys_initialize_settings(hactool_settings_t *settings, FILE *f) {
                 }
             }
             if (!matched_key && !settings->skip_key_warnings) {
-                fprintf(stderr, "[WARN]: Failed to match key \"%s\", (value \"%s\")\n", key, value);
+                fprintf(stderr, "[WARN]: Failed to match key \"%s\"\n", key);
             }
         }
     }

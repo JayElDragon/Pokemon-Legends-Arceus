@@ -24,6 +24,14 @@ android {
         defaultConfig.applicationIdSuffix ".importer"
     }
     sourceSets {
-        main { java.srcDirs = ['src/main/java', '../../third_party/SDL3/android-project/app/src/main/java'] }
+        main {
+            java.srcDirs = ['src/main/java', '../../third_party/SDL3/android-project/app/src/main/java']
+            assets.srcDirs += ['../../third_party/fonts']
+            if (providers.gradleProperty("androidToolchain").isPresent()) {
+                def toolchain = file(providers.gradleProperty("androidToolchain").get())
+                assets.srcDirs += [new File(toolchain, "assets")]
+                jniLibs.srcDirs += [new File(toolchain, "jniLibs")]
+            }
+        }
     }
 }

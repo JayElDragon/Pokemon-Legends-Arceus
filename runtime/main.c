@@ -176,7 +176,14 @@ void backend_quit(void);              // quitting: the render thread stopped, th
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
     while (SDL_PollEvent(&e))
-        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); backend_quit(); exit(0); }
+        if (e.type == SDL_EVENT_QUIT) {
+            LOG("window closed\n");
+            backend_quit();
+#ifdef __ANDROID__
+            remove("running.flag");  // (a proper quit: nothing for the next start to offer safe options for - android_glue.c)
+#endif
+            exit(0);
+        }
 }
 
 static void teardown(void) {

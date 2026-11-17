@@ -826,6 +826,11 @@ void pla_gamefile_keys_path(char *out, size_t n);
 void pla_gamefiles_done(bool forget);
 bool pla_gamefiles_import(const char *keys, int base_fd, int upd_fd, const char *out, char *err, size_t errn);
 void pla_gamefiles_progress(uint64_t *done, uint64_t *total, int *phase);
+bool pla_session_crashed(void);  // (android_glue.c: crash recovery)
+void pla_session_playing(void);
+bool pla_driver_turnip_active(void);
+void pla_driver_choose(bool turnip);
+void pla_restart_app(void);
 }
 static std::atomic<bool> g_android_importing{false};
 static bool g_android_imported;  // (the "you may delete your files now" note on the start screen)
@@ -854,6 +859,14 @@ static bool build_game_code(void) {
     int jobs = cores < ram_jobs ? cores : ram_jobs;
     if (jobs < 1) jobs = 1;
     if (jobs > 10) jobs = 10;
+#ifdef __ANDROID__
+    // (a phone: the cold giants are built at -O0 and most chunks need well under 1 GB; two cores left for the UI)
+    int phone_ram_jobs = ram_gb > 3 ? (ram_gb - 3) * 2 / 3 : 1;
+    jobs = cores > 3 ? cores - 2 : 1;
+    if (jobs > phone_ram_jobs) jobs = phone_ram_jobs;
+    if (jobs > 6) jobs = 6;
+    if (jobs < 1) jobs = 1;
+#endif
     GameBuildOpts o = {build_progress, jobs, build_cancelled};
     char why[256] = "";
     g_build_frac = 0;
@@ -861,12 +874,22 @@ static bool build_game_code(void) {
     if (!ok) {
         fprintf(stderr, "[launcher] game code: %s\n", why);
         if (g_cancel_build) set_job("Compilation cancelled. Completed files are kept.");
-        else set_failure(FAIL_BUILD, gamebuild_killed() ? why : "");
+        else set_failure(FAIL_BUILD, why);
     }
     return ok;
 }
 
 #ifdef __ANDROID__
+static void *android_build_thread(void *) {
+    g_copy_skipped = true;
+    g_cancel_build = false;
+    if (build_game_code()) set_job("Game files and code ready.");
+    pthread_mutex_lock(&g_lock);
+    g_busy = false;
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
 static void *android_import_thread(void *) {
     g_done = 0, g_total = 0, g_phase_base = 0, g_build_frac = -1, g_copy_skipped = false, g_import_mode = true;
     g_fail = 0, g_fail_detail.clear();
@@ -903,6 +926,11 @@ static void *android_import_thread(void *) {
             set_job("Game files ready.");
             pla_gamefiles_done(true);  // (forgotten: the player may delete them)
             g_android_imported = true;
+            if (!gamelib_present(g_root.c_str()) && gamebuild_available()) {
+                g_copy_skipped = true;
+                g_cancel_build = false;
+                if (build_game_code()) set_job("Game files and code ready.");
+            }
         } else set_failure(why.find("version") != std::string::npos ? FAIL_VERSION : FAIL_MISSING);
     }
     pthread_mutex_lock(&g_lock);
@@ -1480,6 +1508,31 @@ static void save_restore(const std::string &dir) {
     g_save_msg = TR("Backup restored. The save it replaced is now a backup too.",
                     "Backup restaurado. O save que estava antes também virou backup.");
 }
+#ifdef __ANDROID__
+// Saves on Android (no folder picker, no system tar): android/app/.../SaveTransfer.java exports and opens the .zip
+// itself and reports here, from its own thread; a picked save becomes the folder import_save() reads.
+static std::string g_save_msg_pending;
+static int g_save_pending_failed = -1;  // -1 nothing new, 0 / 1 the message is a success / a failure
+extern "C" void pla_save_export(void);  // android/android_glue.c
+extern "C" void pla_save_import(void);
+extern "C" void launcher_save_result(int code, const char *detail) {
+    std::string d = detail ? detail : "", m;
+    if (code == 1) m = std::string(UI_TR3("Save exported to ", "Save exportado para ", "Partida exportada a ")) + d;
+    else if (code == 2) m = std::string(UI_TR3("The save couldn't be exported: ", "Não deu para exportar o save: ",
+                                               "No se pudo exportar la partida: ")) + d;
+    else if (code == 3) m = std::string(UI_TR3("That file couldn't be read: ", "Não deu para ler esse arquivo: ",
+                                               "No se pudo leer ese archivo: ")) + d;
+    else m = UI_TR3("There's no save to export yet.", "Ainda não há save para exportar.", "Aún no hay partida para exportar.");
+    pthread_mutex_lock(&g_lock);
+    g_save_msg_pending = m, g_save_pending_failed = code != 1;
+    pthread_mutex_unlock(&g_lock);
+}
+extern "C" void launcher_save_picked(const char *dir) {
+    pthread_mutex_lock(&g_lock);
+    g_save_pick = dir ? dir : "";
+    pthread_mutex_unlock(&g_lock);
+}
+#endif
 static void SDLCALL picked_export(void *, const char *const *files, int) {
     if (!files || !files[0]) return;
     pthread_mutex_lock(&g_lock);
@@ -2600,6 +2653,22 @@ extern "C" void launcher_run(const char *root) {
     std::string status = check_game_files(g_root);
     if (status.empty() && prompts_wanted()) make_prompts(false);  // (set up before the icons existed: made now, aside)
     g_tab = TAB_PLAY, g_focus_play = true, g_changing_folder = false;
+#ifdef __ANDROID__
+    if (status == "Game code not built yet" && gamebuild_available() && !getenv("LARECOMP_LAUNCHER_SHOT")) {
+        pthread_mutex_lock(&g_lock);
+        g_busy = true;
+        pthread_mutex_unlock(&g_lock);
+        pthread_t worker;
+        int error = pthread_create(&worker, NULL, android_build_thread, NULL);
+        if (!error) pthread_detach(worker);
+        else {
+            set_failure(FAIL_BUILD, strerror(error));
+            pthread_mutex_lock(&g_lock);
+            g_busy = false;
+            pthread_mutex_unlock(&g_lock);
+        }
+    }
+#endif
     g_mods_changed = true, g_save_scanned = false;
     bool play = false;
     // LARECOMP_LAUNCHER_SHOT=<frame>[:<page>] (test): save build/launcher.png at that frame and exit; page: mods /
@@ -2924,7 +2993,8 @@ extern "C" void launcher_run(const char *root) {
                     snprintf(pct, sizeof pct, "%d%%", (int)(f * 100));
                     ImVec2 ps = text(dl, F_H2, 30, x + 24, cy + 16, C_GOLD_HI, pct);
 #ifdef __ANDROID__
-                    const char *now_t = step == 0 ? UI_TR3("Reading your keys and your game", "Lendo as suas keys e o seu jogo", "Leyendo tus keys y tu juego")
+                    const char *now_t = building ? UI_TR3("Compiling the game code", "Compilando o código do jogo", "Compilando el código del juego")
+                                      : step == 0 ? UI_TR3("Reading your keys and your game", "Lendo as suas keys e o seu jogo", "Leyendo tus keys y tu juego")
                                       : step == 1 ? UI_TR3("Saving the game data", "Guardando os dados do jogo", "Guardando los datos del juego")
                                                   : UI_TR3("Checking the files", "Verificando os arquivos", "Comprobando los archivos");
 #else
@@ -2978,10 +3048,32 @@ extern "C" void launcher_run(const char *root) {
                 else if (status == "Game code not built yet" && !g_changing_folder) {
                     page_title(dl, x, 104, UI_TR3("GAME FILES", "ARQUIVOS DO JOGO", "ARCHIVOS DEL JUEGO"),
                                UI_TR3("Game files imported", "Arquivos importados", "Archivos importados"));
-                    text(dl, F_BODY, 18, x, 196, C_SOFT,
-                         UI_TR3("The game files are verified. Playing requires an Android build of the game code.",
-                                "Os arquivos estão verificados. Para jogar, é necessário compilar o código do jogo para Android.",
-                                "Los archivos están verificados. Para jugar, hace falta compilar el código del juego para Android."), w);
+                    static const bool tools_available = gamebuild_available();
+                    const char *message = tools_available
+                        ? UI_TR3("Compile the imported files to enable Play.", "Compile os arquivos importados para jogar.",
+                                 "Compila los archivos importados para habilitar Jugar.")
+                        : UI_TR3("This APK is missing the Android compiler. The imported files are already saved.",
+                                 "Falta o compilador Android neste APK. Os arquivos importados já foram salvos.",
+                                 "A este APK le falta el compilador de Android. Tus archivos importados ya están guardados.");
+                    float end = 196 + text(dl, F_BODY, 18, x, 196, C_SOFT, message, w).y;
+                    if (tools_available && button("##compile_imported",
+                            UI_TR3("COMPILE GAME", "COMPILAR JOGO", "COMPILAR JUEGO"),
+                            x, end + 22, 0, 64, BTN_PRIMARY, true, IC_PLAY)) {
+                        pthread_mutex_lock(&g_lock);
+                        g_busy = true;
+                        pthread_mutex_unlock(&g_lock);
+                        pthread_t worker;
+                        int error = pthread_create(&worker, NULL, android_build_thread, NULL);
+                        if (!error) pthread_detach(worker);
+                        else {
+                            set_failure(FAIL_BUILD, strerror(error));
+                            pthread_mutex_lock(&g_lock);
+                            g_busy = false;
+                            pthread_mutex_unlock(&g_lock);
+                        }
+                    }
+                    if (failed && g_fail == FAIL_BUILD)
+                        text(dl, F_BODY, 16, x, end + 100, C_SOFT, g_fail_detail.c_str(), w);
                     bar = {C_GOLD, UI_TR3("Game code required", "Código do jogo necessário", "Falta el código recompilado")};
                 }
 #endif
@@ -3180,8 +3272,46 @@ extern "C" void launcher_run(const char *root) {
                     if (g_settings.video_rec == VREC_ASK && g_video_rec.known && settings_video_matches_recommended())
                         g_settings.video_rec = VREC_DONE, settings_save();
                     bool offer_video = g_settings.video_rec == VREC_ASK && g_video_rec.known;
+#ifdef __ANDROID__
+                    {   // the last session ended while playing (android_glue.c: the mark PLAY leaves): safe options
+                        static int crashed = -1;
+                        if (crashed < 0) crashed = pla_session_crashed() ? 1 : 0;
+                        if (crashed == 1) ImGui::OpenPopup("##crashed"), crashed = 2;
+                        if (ImGui::BeginPopupModal("##crashed", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+                            ImGui::PushFont(g_font_menu);
+                            ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s",
+                                               UI_TR3("The game closed unexpectedly", "O jogo fechou inesperadamente",
+                                                      "El juego se cerró inesperadamente"));
+                            ImGui::PopFont();
+                            bool turnip = pla_driver_turnip_active();
+                            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30);
+                            ImGui::TextWrapped("%s", UI_TR3(
+                                "Safe options: 75% internal resolution, standard draw distance, no anti-aliasing, and the "
+                                "system's graphics driver if an imported one is in use (the app restarts). Your save isn't touched.",
+                                "Opções seguras: resolução interna 75%, distância padrão, sem anti-aliasing e o driver gráfico do "
+                                "sistema se um importado estiver em uso (o app reinicia). O seu save não é tocado.",
+                                "Opciones seguras: resolución interna 75 %, distancia estándar, sin suavizado y el driver gráfico "
+                                "del sistema si usas uno importado (la app se reinicia). Tu partida no se toca."));
+                            ImGui::PopTextWrapPos();
+                            ImGui::Spacing();
+                            if (ImGui::Button(UI_TR3("Use safe options", "Usar opções seguras", "Usar opciones seguras"))) {
+                                g_settings.res_mode = RES_Q75, g_settings.res_auto = false;
+                                g_settings.draw_distance = DRAW_DISTANCE_STANDARD;
+                                g_settings.antialias = AA_OFF;
+                                settings_save();
+                                ImGui::CloseCurrentPopup();
+                                if (turnip) { pla_driver_choose(false); pla_restart_app(); }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button(UI_TR3("Keep my settings", "Manter as minhas", "Mantener mis ajustes")))
+                                ImGui::CloseCurrentPopup();
+                            ImGui::EndPopup();
+                        }
+                    }
+#endif
                     if (pressed) {  // first PLAY ever: this PC's video settings, the aspect ratio question, how to reach our menu
 #ifdef __ANDROID__
+                        pla_session_playing();  // (crash recovery: the mark while the game is on screen)
                         play = true;
 #else
                         if (offer_video) ImGui::OpenPopup("##videorec");
@@ -3416,6 +3546,16 @@ extern "C" void launcher_run(const char *root) {
 
             // ================= Saves
             if (g_tab == TAB_SAVES) {
+#ifdef __ANDROID__
+                {   // (Android's export / import ran on a thread of SaveTransfer.java: its outcome shown here)
+                    pthread_mutex_lock(&g_lock);
+                    if (g_save_pending_failed >= 0) {
+                        g_save_msg = g_save_msg_pending, g_save_failed = g_save_pending_failed != 0;
+                        g_save_pending_failed = -1;
+                    }
+                    pthread_mutex_unlock(&g_lock);
+                }
+#endif
                 import_save();  // (a folder picked or dropped: runs here, on the UI thread)
                 save_export();
                 static std::string last_msg;
@@ -3433,6 +3573,27 @@ extern "C" void launcher_run(const char *root) {
                 if (g_save_time) text(dl, F_BODY, 13, x + 44, ly + 66, C_SOFT, (fmt_size(g_save_bytes) + " · save/save_0").c_str());
                 ly += 112;
                 float bx = x + 26;
+#ifdef __ANDROID__
+                // (Android: SaveTransfer.java - its file picker, its own zip code)
+                if (button("##import", UI_TR3("Import save...", "Importar save...", "Importar partida..."), bx, ly, 0, 46,
+                           BTN_PRIMARY, true, IC_UP_ARROW, F_LABEL, 15, false))
+                    pla_save_import();
+                bx += ImGui::GetItemRectSize().x / g_s + 10;
+                if (button("##export", UI_TR3("Export (.zip)", "Exportar (.zip)", "Exportar (.zip)"), bx, ly, 0, 46,
+                           BTN_SECONDARY, g_save_time != 0, IC_DOWN_ARROW))
+                    pla_save_export();
+                ly += 64;
+                const char *from = UI_TR3(
+                    "Where from: a .zip exported from Arceus Recomp or PokeL-ARecomp, a JKSV backup (zipped, or its file "
+                    "\"main\") or a save from an emulator (its file \"main\"). Your current save becomes a backup first, so "
+                    "nothing is lost. The save must be from the same game version or older.",
+                    "De onde: um .zip exportado do Arceus Recomp ou do PokeL-ARecomp, um backup do JKSV (em .zip, ou o "
+                    "arquivo \"main\") ou um save de emulador (o arquivo \"main\"). O save atual vira um backup antes, então "
+                    "nada se perde. O save precisa ser da mesma versão do jogo ou mais antiga.",
+                    "De dónde: un .zip exportado de Arceus Recomp o PokeL-ARecomp, un respaldo de JKSV (en .zip, o su "
+                    "archivo \"main\") o una partida de un emulador (su archivo \"main\"). Tu partida actual se guarda antes "
+                    "como respaldo, así que no se pierde nada. La partida debe ser de la misma versión del juego o anterior.");
+#else
                 if (button("##import", TR("Import save...", "Importar save..."), bx, ly, 0, 46, BTN_PRIMARY, true, IC_UP_ARROW,
                            F_LABEL, 15, false))
                     SDL_ShowOpenFolderDialog(picked_save, NULL, win, NULL, false);
@@ -3455,6 +3616,7 @@ extern "C" void launcher_run(const char *root) {
                                       "save de emulador ou de outra cópia do PokeL-ARecomp. Escolha a pasta com o arquivo "
                                       "\"main\", ou arraste ela (ou um .zip) para esta janela. O save atual vira um backup "
                                       "antes, então nada se perde. O save precisa ser da mesma versão do jogo ou mais antiga.");
+#endif
                 float fh = text_size(F_BODY, 14, from, cw - 92).y;
                 panel(dl, x + 26, ly, cw - 52, fh + 32, IM_COL32(255, 255, 255, 10), IM_COL32(255, 255, 255, 40), 14);
                 text(dl, F_BODY, 14, x + 46, ly + 16, C_SOFT, from, cw - 92);

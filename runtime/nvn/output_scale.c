@@ -76,7 +76,11 @@ int g_out_present_interval = 1;
 // a faster frame. tools/test_dynres.py: the controller against a simulated GPU (the UHD 770 cases).
 #define DYN_N 30            // frames per decision (~half a second)
 #define DYN_FLOOR_LINES 540.0     // the floor: at least this many render lines...
+#ifdef __ANDROID__
+#define DYN_FLOOR_SHARE 0.6  // (a phone's screen held close: below 60% FSR 1 can't hide the steps - Medium profile)
+#else
 #define DYN_FLOOR_SHARE (1.0 / 3)  // ... and at least this share of the Match display's
+#endif
 #define DYN_STEP 0.1        // the factor's grid (the floor below its first step)
 #define DYN_BUDGET 14.5     // ms of GPU work per frame at 60 fps (G + W)
 #define DYN_RAISE_FIT 0.9   // a hold's raise: predicted G + W under this share of the budget

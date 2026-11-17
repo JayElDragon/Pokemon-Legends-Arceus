@@ -179,6 +179,71 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
     return (p.optimalTilingFeatures & want) == want;
 }
 
+// ---- BCn decoded on the CPU, for GPUs without BC textures (Arm Mali and Imagination PowerVR - the GPUs in MediaTek
+// and Exynos phones - and Qualcomm's own Adreno driver; Turnip has them). third_party/bcdec (Unlicense).
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_STATIC
+#define BCDEC_BC4BC5_PRECISE  // (signed BC4 / BC5)
+#include "../../../third_party/bcdec/bcdec.h"
+
+// 1-7 = BC1-BC7 (6: BC6H), 0 = not BC
+static int bc_kind_of(VkFormat f, bool *is_signed) {
+    *is_signed = false;
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 1;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: return 2;
+    case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: return 3;
+    case VK_FORMAT_BC4_SNORM_BLOCK: *is_signed = true; return 4;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return 4;
+    case VK_FORMAT_BC5_SNORM_BLOCK: *is_signed = true; return 5;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return 5;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: *is_signed = true; return 6;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 6;
+    case VK_FORMAT_BC7_UNORM_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK: return 7;
+    default: return 0;
+    }
+}
+static bool bc_is_srgb(VkFormat f) {
+    return f == VK_FORMAT_BC1_RGB_SRGB_BLOCK || f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || f == VK_FORMAT_BC2_SRGB_BLOCK ||
+           f == VK_FORMAT_BC3_SRGB_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+// a decoded texel's bytes: R8 for BC4, RG8 for BC5 (a quarter / half of RGBA8's memory; the shaders read the same
+// r, g, 0, 1), RGBA16F for BC6H, else RGBA8
+static uint32_t bc_texel(int kind) { return kind == 6 ? 8 : kind == 4 ? 1 : kind == 5 ? 2 : 4; }
+
+// wb x hb blocks (linear rows) -> w x h texels (bc_texel): RGBA8 (BC1-3, BC7), R8 / RG8 (BC4 / BC5, signed for SNORM),
+// RGBA16F for BC6H (alpha 1.0)
+static void bc_decode(int kind, bool sgn, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t w, uint32_t h, void *out) {
+    uint32_t bs = kind == 1 || kind == 4 ? 8 : 16, texel = bc_texel(kind);
+    uint8_t tmp[4 * 4 * 8];
+    for (uint32_t by = 0; by < hb; by++)
+        for (uint32_t bx = 0; bx < wb; bx++) {
+            const uint8_t *blk = blocks + ((uint64_t)by * wb + bx) * bs;
+            switch (kind) {
+            case 1: bcdec_bc1(blk, tmp, 16); break;
+            case 2: bcdec_bc2(blk, tmp, 16); break;
+            case 3: bcdec_bc3(blk, tmp, 16); break;
+            case 7: bcdec_bc7(blk, tmp, 16); break;
+            case 4: bcdec_bc4(blk, tmp, 4, sgn); break;   // (R8: 4 bytes a row)
+            case 5: bcdec_bc5(blk, tmp, 8, sgn); break;   // (RG8: 8 bytes a row)
+            case 6: {
+                uint16_t rgb[48];
+                bcdec_bc6h_half(blk, rgb, 12, sgn);
+                uint16_t *o = (uint16_t *)tmp;
+                for (int i = 0; i < 16; i++) o[i * 4] = rgb[i * 3], o[i * 4 + 1] = rgb[i * 3 + 1], o[i * 4 + 2] = rgb[i * 3 + 2], o[i * 4 + 3] = 0x3C00;
+                break;
+            }
+            }
+            uint32_t x0 = bx * 4, y0 = by * 4;
+            uint32_t cw = w - x0 < 4 ? w - x0 : 4, ch = h - y0 < 4 ? h - y0 : 4;
+            if (x0 >= w || y0 >= h) continue;
+            for (uint32_t y = 0; y < ch; y++)
+                memcpy((uint8_t *)out + ((uint64_t)(y0 + y) * w + x0) * texel, tmp + (uint64_t)y * 4 * texel, (size_t)cw * texel);
+        }
+}
+
 // (shader preparation) the format and aspects an image of this NVN format gets as a render target
 // (create_backend_image: a format the device can't sample becomes RGBA8; compressed formats are never targets)
 VkFormat vk_image_format(uint32_t nvn, VkImageAspectFlags *aspect) {
@@ -222,21 +287,22 @@ static bool tex_scalable(const NvnTexture *t) {
 // quarter of the bigger map was drawn), so square render-target arrays of 2-4 layers are scaled too, depth or not.
 // Z-A at 4x: 4096x4096 x 3, ~240 MB of GPU memory for the two (15 MB at the game's size); RTX 4060, 1.5x, the shadow
 // passes 3.1-3.4 -> 3.7 ms a frame. 1 (the game's size) by default.
+// Shadow resolution 0 (Android's low-spec profile; LARECOMP_SHADOW_SCALE=0.5): half the game's size - a quarter of the
+// shadow passes' pixels, softer shadow edges.
 static float tex_shadow_scale(const NvnTexture *t) {
-    static int k = -1;
+    static float k = -1;
     if (k < 0) {
         const char *e = getenv("LARECOMP_SHADOW_SCALE");
-        k = e ? atoi(e) : g_settings.shadow_res;
-        if (k < 1) k = 1;
-        if (k > 4) k = 4;
+        k = e ? (float)atof(e) : g_settings.shadow_res == 0 ? 0.5f : (float)g_settings.shadow_res;
+        k = k < 0.75f ? 0.5f : k > 4 ? 4 : roundf(k);
     }
     if (k == 1 || !(t->flags & 8) || t->samples > 1 || t->width != t->height || t->width < 256 || t->width * k > 8192) return 1;
     bool array = t->target == 4 && t->depth >= 2 && t->depth <= 4;
     if (!array && !(t->target == 1 && renderer_format_is_depth(t->format))) return 1;
     static int nlog;
     if (nlog++ < 4) LOG("[vk] shadow map %s %ux%u (%u layers) drawn at %ux%u\n", renderer_format_is_depth(t->format) ? "depth" : "colour", t->width, t->height, t->target == 4 ? t->depth : 1,
-                        t->width * k, t->height * k);
-    return (float)k;
+                        (unsigned)(t->width * k), (unsigned)(t->height * k));
+    return k;
 }
 
 bool renderer_texture_first_write(NvnTexture *t) {
@@ -295,7 +361,7 @@ bool renderer_texture_presented(NvnTexture *t) {
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
-    if (b && (b->scalable || b->hd || b->shadow_k > 1)) { *sx = b->sx; *sy = b->sy; }
+    if (b && (b->scalable || b->hd || b->bc_skip || (b->shadow_k > 0 && b->shadow_k != 1))) { *sx = b->sx; *sy = b->sy; }
     else { *sx = 1; *sy = 1; }
 }
 
@@ -371,7 +437,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         if (tw < 1) tw = 1;
         if (th < 1) th = 1;
     }
-    if (b->shadow_k > 1) {
+    if (b->shadow_k > 0 && b->shadow_k != 1) {  // (bigger, or half: shadow resolution 0)
         tw = (uint32_t)lroundf(tw * b->shadow_k); th = (uint32_t)lroundf(th * b->shadow_k);
         b->sx = b->sy = b->shadow_k;
     }
@@ -398,14 +464,51 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat vf = mf.vf;
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     b->astc_bw = b->astc_bh = 0;
-    if (!format_supports(vf, need)) {
+    b->bc_kind = 0, b->bc_signed = false, b->bc_skip = 0;
+    static int no_bc = -1;  // LARECOMP_VK_NO_BC=1 (test): BC textures decoded as on a GPU without them (Mali)
+    if (no_bc < 0) no_bc = ENV("LARECOMP_VK_NO_BC") && atoi(ENV("LARECOMP_VK_NO_BC"));
+    bool bc_fake;
+    if (!format_supports(vf, need) || (no_bc && bc_kind_of(vf, &bc_fake))) {
         bool astc = vf >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
         const FormatInfo *fi = t->layout.fmt;
+        int bc = bc_kind_of(vf, &b->bc_signed);
         if (astc && fi && fi->bpb == 16) {  // desktop GPUs: decoded on the CPU into an RGBA8 image of the same colour space
             b->astc_bw = fi->bw;
             b->astc_bh = fi->bh;
             b->astc_srgb = t->format >= 0x87;
             vf = b->astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        } else if (bc && fi && (fi->bpb == 8 || fi->bpb == 16)) {
+            // BCn on a GPU without it (Mali, PowerVR - MediaTek's GPUs - and Qualcomm's own driver): decoded on the CPU
+            // (bc_decode) into an uncompressed image the shaders read the same way - RGBA8 (sRGB kept), signed RGBA8
+            // for BC4 / BC5 SNORM, half floats for BC6H. Before this they were left empty: black or missing textures.
+            b->bc_kind = (uint8_t)bc;
+            vf = bc == 6 ? VK_FORMAT_R16G16B16A16_SFLOAT
+               : bc == 4 ? (b->bc_signed ? VK_FORMAT_R8_SNORM : VK_FORMAT_R8_UNORM)
+               : bc == 5 ? (b->bc_signed ? VK_FORMAT_R8G8_SNORM : VK_FORMAT_R8G8_UNORM)
+               : b->bc_signed ? VK_FORMAT_R8G8B8A8_SNORM
+               : bc_is_srgb(mf.vf) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            // A phone with 8 GB of RAM or less (LARECOMP_BC_HALF=1 / =0: always / never): the big colour textures
+            // without their largest level - a quarter of their memory; the game's level n is drawn from its n + 1
+            // (the view's levels and texel-based reads shifted: renderer_texture_scale). Decoded, an RGBA8 2048 x 2048
+            // with its levels is 21 MB where its BC7 was 5.
+            static int half = -1;
+            if (half < 0) {
+                const char *e = ENV("LARECOMP_BC_HALF");
+#ifdef __ANDROID__
+                half = e && *e ? atoi(e) != 0 : android_ram_gb() <= 8;
+#else
+                half = e && *e && atoi(e) != 0;
+#endif
+                if (half) LOG("[vk] BC textures of 1024+ texels: decoded without their largest level (%d GB RAM)\n", android_ram_gb());
+            }
+            if (half && (bc == 1 || bc == 2 || bc == 3 || bc == 7) && !(t->flags & 8) && levels >= 2 && depth == 1 &&
+                (t->target == 1 || t->target == 4) && tw >= 1024 && th >= 1024 && !b->scalable) {
+                b->bc_skip = 1;
+                tw >>= 1, th >>= 1, levels--;
+                b->sx = b->sy = 0.5f;
+            }
+            static int nlog;
+            if (nlog++ < 4) LOG("[vk] BC%d textures without GPU support: decoded on upload (vk format %d)\n", bc, vf);
         } else {
             static int nlog;
             if (nlog++ < 20) LOG("[vk] format %d (nvn %#x) not supported: RGBA8 instead\n", vf, t->format);
@@ -1142,7 +1245,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (hd_has(h) && hd_replace(t, b, h)) return;
         if (hd_dump) hd_queue_dump(t, h);
     }
-    if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
+    if (b->format != mf.vf && !b->astc_bw && !b->bc_kind) return;  // unsupported format: nothing sensible to copy
     slow_note_upload(total);
     prof_tex_uploads++;
     prof_tex_upload_bytes += total;
@@ -1151,7 +1254,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint64_t layer_size = tegra_layer_size(&t->layout);
     bool linear = (t->flags & 0x10) != 0;
-    uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    uint32_t levels = t->layout.levels < b->levels + b->bc_skip ? t->layout.levels : b->levels + b->bc_skip;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
@@ -1167,6 +1270,25 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
+                vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
+                rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                continue;
+            }
+            if (b->bc_kind) {  // BCn without GPU support: blocks -> linear block rows -> decoded texels (bc_decode)
+                if (lv < b->bc_skip) continue;  // (its largest level left out: bc_skip)
+                uint32_t dl = lv - b->bc_skip;
+                const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+                uint32_t bpb = fi->bpb;
+                uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * bpb);
+                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * bpb, src + (uint64_t)y * t->stride, l.wb * bpb);
+                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, bpb, l.block_height_log2, l.block_depth_log2);
+                uint32_t texel = bc_texel(b->bc_kind);
+                VkSpan s = vk_texture_staging((uint64_t)l.w * l.h * texel);
+                bc_decode(b->bc_kind, b->bc_signed, blocks, l.wb, l.hb, l.w, l.h, s.ptr);
+                free(blocks);
+                VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
+                                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dl, b->depth > 1 ? 0 : layer, 1},
+                                        .imageExtent = {l.w < level_w(b, dl) ? l.w : level_w(b, dl), l.h < level_h(b, dl) ? l.h : level_h(b, dl), 1}};
                 vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
                 continue;
@@ -1476,6 +1598,7 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         }
     }
     uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
+    lv0 = lv0 > b->bc_skip ? lv0 - b->bc_skip : 0;  // (a decoded BC texture without its largest level: one level less)
     uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);
     uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
     uint32_t nly = v && (v->setmask & 2) && v->num_layers ? v->num_layers : b->layers - (ly0 < b->layers ? ly0 : 0);

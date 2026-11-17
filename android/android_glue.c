@@ -22,8 +22,27 @@ JNIEXPORT void JNICALL Java_com_jay_plarecomp_PlaActivity_nativeThermal(JNIEnv *
 
 // The app off the screen (PlaActivity onPause / onResume): runtime/nvn/vulkan/device.c backend_present waits on it
 volatile int pla_background;
+// ---- crash recovery: a mark file in the data root while the game is on screen (PLAY to the background or a proper
+// exit). Still there at the next start: the last session ended while playing - a GPU loss, a crash, Android killing
+// it - and the start screen offers safe options (runtime/ui/launcher.mm). Swiping the app away happens after
+// onPause, which removes the mark, so that doesn't count.
+static volatile int pla_playing;
+static void session_mark(int on) {
+    if (on) { FILE *f = fopen("running.flag", "w"); if (f) fclose(f); }
+    else remove("running.flag");
+}
+void pla_session_playing(void) { pla_playing = 1; session_mark(1); }
+bool pla_session_crashed(void) {
+    FILE *f = fopen("running.flag", "r");
+    if (!f) return false;
+    fclose(f);
+    remove("running.flag");
+    return true;
+}
+
 JNIEXPORT void JNICALL Java_com_jay_plarecomp_PlaActivity_nativeBackground(JNIEnv *env, jclass cls, jboolean background) {
     pla_background = background ? 1 : 0;
+    if (pla_playing) session_mark(!background);
 }
 
 // ---- the graphics driver rows of the port menu (runtime/ui/menu.mm, Graphics tab) -> PlaActivity / DriverStore.java
@@ -58,6 +77,7 @@ void pla_driver_choose(bool turnip) { activity_call("driverChoose", 'B', turnip,
 void pla_driver_import(void) { activity_call("driverImport", 'V', 0, NULL, 0); }
 void pla_edit_touch_layout(void) { activity_call("editTouchLayout", 'V', 0, NULL, 0); }
 void pla_driver_status(char *out, size_t n) { out[0] = 0; activity_call("driverStatus", 'S', 0, out, n); }
+void pla_driver_name(char *out, size_t n) { out[0] = 0; activity_call("driverName", 'S', 0, out, n); }  // (the imported driver: "Turnip 25.1", ...)
 void pla_restart_app(void) { activity_call("restartApp", 'V', 0, NULL, 0); }
 
 // ---- Game Files (runtime/ui/launcher.mm -> PlaActivity / GameFiles.java): kind 0 prod.keys, 1 game, 2 update
@@ -93,8 +113,25 @@ void pla_gamefile_label(int kind, char *out, size_t n) { activity_call_int("game
 int pla_gamefile_open(int kind) { return activity_call_int("gameFileOpen", "(I)I", kind, NULL, 0); }
 void pla_gamefile_keys_path(char *out, size_t n) { activity_call_int("gameFileKeysPath", "()Ljava/lang/String;", 0, out, n); }
 void pla_gamefiles_done(bool forget) { activity_call("gameFilesDone", 'B', forget, NULL, 0); }
+
+// ---- Saves tab (runtime/ui/launcher.mm): Android's file picker and zip code (SaveTransfer.java)
+void pla_save_export(void) { activity_call("saveExport", 'V', 0, NULL, 0); }
+void pla_logs_export(void) { activity_call("logsExport", 'V', 0, NULL, 0); }  // (the port menu: SaveTransfer.pickLogs)
+void pla_save_import(void) { activity_call("saveImport", 'V', 0, NULL, 0); }
+void launcher_save_result(int code, const char *detail);  // runtime/ui/launcher.mm
+void launcher_save_picked(const char *dir);
+JNIEXPORT void JNICALL Java_com_jay_plarecomp_SaveTransfer_nativeSaveResult(JNIEnv *env, jclass cls, jint code, jstring detail) {
+    const char *d = detail ? (*env)->GetStringUTFChars(env, detail, NULL) : NULL;
+    launcher_save_result(code, d ? d : "");
+    if (d) (*env)->ReleaseStringUTFChars(env, detail, d);
+}
+JNIEXPORT void JNICALL Java_com_jay_plarecomp_SaveTransfer_nativeSavePicked(JNIEnv *env, jclass cls, jstring dir) {
+    const char *d = dir ? (*env)->GetStringUTFChars(env, dir, NULL) : NULL;
+    if (d) launcher_save_picked(d), (*env)->ReleaseStringUTFChars(env, dir, d);
+}
 // The driver this process runs on (PlaActivity set PLA_VULKAN_DRIVER at start for Turnip)
-bool pla_driver_turnip_active(void) { return getenv("PLA_VULKAN_DRIVER") != NULL; }
+bool pla_gpu_is_adreno(void);  // android/vulkan_driver.c
+bool pla_driver_turnip_active(void) { return getenv("PLA_VULKAN_DRIVER") != NULL && pla_gpu_is_adreno(); }
 
 JNIEXPORT void JNICALL Java_com_jay_plarecomp_PlaActivity_touchState(
     JNIEnv *env, jclass cls, jint buttons, jint lx, jint ly, jint rx, jint ry) {

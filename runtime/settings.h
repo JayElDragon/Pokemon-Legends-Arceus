@@ -184,7 +184,19 @@ typedef struct {
     int res_mode;        // RES_*
     bool fps60, aniso16;
     char gpu[96];        // the GPU's name, for the start screen's question
+    // Android (settings.c android_profile): the rest of a phone's profile
+    bool fps60_lock;     // 60 fps always (else: back to 30 by itself when the phone can't hold it)
+    int draw_distance, antialias, shadow_res, gtao;
+    bool water_ssr;
 } VideoRec;
+// Android: the Adreno model in a Vulkan device name ("Adreno (TM) 830", "Turnip Adreno (TM) 650"), else 0
+int android_adreno_model(const char *gpu_name);
+// Android: the phone's RAM in GB (rounded), for the profile and the BC texture budget (vulkan/textures.c)
+int android_ram_gb(void);
+// Android: a performance profile's values (VPROF_LIGHT..VPROF_HIGH) into g_settings (the menu's Performance profile)
+void settings_android_apply_profile(int profile);
+// Android: the profile the current settings are (VPROF_*), or -1 for a mix of the player's own
+int settings_android_current_profile(void);
 extern VideoRec g_video_rec;
 const char *video_profile_name(int profile, bool pt);
 void settings_video_recommend(unsigned vendor, bool integrated, uint64_t vram, const char *gpu_name);
